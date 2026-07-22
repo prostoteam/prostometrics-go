@@ -1,0 +1,165 @@
+package prostometrics
+
+import (
+	"net/url"
+	"strings"
+	"time"
+)
+
+const (
+	defaultQueueSize                 = 64 * 1024
+	defaultMaxBatchSize              = 512
+	defaultMaxSeriesPerBatch         = 2048
+	defaultMaxDictionarySeries       = defaultMaxSeriesPerBatch
+	defaultMaxTotalSeries            = defaultMaxSeriesPerBatch
+	defaultFlushInterval             = 500 * time.Millisecond
+	defaultFlushTimeout              = 5 * time.Second
+	defaultRetryQueueSize            = 128
+	defaultRetryFlushMaxSends        = 1
+	defaultRetryMaxAttempts          = 8
+	defaultRetryBaseDelay            = time.Second
+	defaultRetryMaxDelay             = 8 * time.Second
+	defaultRetryJitterWindow         = time.Second
+	defaultClientBackoffMaxDelay     = 30 * time.Second
+	defaultClientBackoffJitterWindow = 5 * time.Second
+	defaultEndpointHost              = "prostometrics.ru"
+	defaultIngestPath                = "/api/i/batch"
+	defaultStopStatusCode            = 401
+	batchIDHeaderName                = "X-PM-Batch-Id"
+	workloadHeaderName               = "X-PM-Workload"
+	workloadMaxLen                   = 100
+	maxMetricBytes                   = 30
+	maxLabelsPerSeries               = 8
+	maxLabelBytes                    = 512
+	maxBatchBodyBytes                = 16 * 1024
+	maxCounterValue                  = float64(^uint32(0))
+	maxSampleValue                   = float64(^uint32(0) / 10)
+)
+
+var defaultStopResponseCodes = [...]string{
+	"unauthorized",
+	"unsupported_protocol_version",
+}
+
+// Config contains the public settings needed to connect the client.
+type Config struct {
+	Endpoint  string
+	APIKey    string
+	Transport Transport
+	Logger    Logger
+	Verbose   bool
+}
+
+// Logger is the minimal logging interface used by the library.
+type Logger interface {
+	Printf(format string, args ...any)
+}
+
+type noopLogger struct{}
+
+func (noopLogger) Printf(string, ...any) {}
+
+func (c *Config) applyDefaults() error {
+	if c.Endpoint == "" && c.Transport == nil {
+		c.Endpoint = EndpointFromHost(defaultEndpointHost)
+	}
+	if c.Endpoint != "" {
+		c.Endpoint = ensureIngestPath(c.Endpoint)
+	}
+	if c.Logger == nil {
+		c.Logger = noopLogger{}
+	}
+	if c.Transport == nil && c.Endpoint != "" {
+		c.Transport = &HTTPTransport{
+			Endpoint: c.Endpoint,
+			APIKey:   c.APIKey,
+			Logger:   c.Logger,
+		}
+	}
+	if ht, ok := c.Transport.(*HTTPTransport); ok {
+		if ht.Logger == nil {
+			ht.Logger = c.Logger
+		}
+		if c.APIKey != "" && ht.APIKey == "" {
+			ht.APIKey = c.APIKey
+		}
+		transportAPIKey := ht.APIKey
+		if hasAuthorizationHeader(ht.Header) && transportAPIKey != "" {
+			return ErrAPIKeyAuthorizationConflict
+		}
+		if transportAPIKey == "" {
+			return ErrMissingAPIKey
+		}
+		ht.APIKey = transportAPIKey
+		c.APIKey = transportAPIKey
+	}
+	return nil
+}
+
+func validateWorkload(workload string) error {
+	if workload == "" {
+		return ErrInvalidWorkload
+	}
+	if len(workload) > workloadMaxLen {
+		return ErrInvalidWorkload
+	}
+	for i := 0; i < len(workload); i++ {
+		ch := workload[i]
+		switch {
+		case ch >= 'a' && ch <= 'z':
+		case ch >= 'A' && ch <= 'Z':
+		case ch >= '0' && ch <= '9':
+		case ch == '.' || ch == '-' || ch == '_' || ch == '/':
+		default:
+			return ErrInvalidWorkload
+		}
+	}
+	return nil
+}
+
+// EndpointFromHost builds the ingest endpoint from a host (with or without scheme)
+// and appends the default ingest path when missing.
+func EndpointFromHost(host string) string {
+	host = strings.TrimSpace(host)
+	if host == "" {
+		return ""
+	}
+	if strings.HasPrefix(host, "http://") || strings.HasPrefix(host, "https://") {
+		return ensureIngestPath(host)
+	}
+	return ensureIngestPath("https://" + host)
+}
+
+// ensureIngestPath appends the ingest path when the provided endpoint has no path.
+// On parse errors, the original string is returned unchanged.
+func ensureIngestPath(endpoint string) string {
+	if endpoint == "" {
+		return ""
+	}
+	u, err := url.Parse(endpoint)
+	if err != nil {
+		return endpoint
+	}
+	if u.Path == "" || u.Path == "/" {
+		u.Path = defaultIngestPath
+	}
+	return u.String()
+}
+
+func hasAuthorizationHeader(h map[string][]string) bool {
+	if len(h) == 0 {
+		return false
+	}
+	for k, values := range h {
+		if !strings.EqualFold(k, "Authorization") {
+			continue
+		}
+		for _, v := range values {
+			if strings.TrimSpace(v) != "" {
+				return true
+			}
+		}
+		return false
+	}
+	return false
+}
